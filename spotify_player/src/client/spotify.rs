@@ -265,6 +265,21 @@ impl WebApiClient {
         }
     }
 
+    fn is_long_rate_limit(error: &ClientError) -> bool {
+        match error {
+            ClientError::Http(error) => match error.as_ref() {
+                HttpError::StatusCode(response) => {
+                    super::middleware::SpotifyApiMiddleware::is_long_rate_limit(
+                        response.status(),
+                        response.headers(),
+                    )
+                }
+                HttpError::Client(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     fn log_fallback(method: &str, url: &str, status: reqwest::StatusCode) {
         tracing::warn!(
             method,
@@ -304,9 +319,14 @@ impl BaseClient for WebApiClient {
 
         match self.primary.api_get(url, payload).await {
             Err(error) => match (Self::fallback_status(&error), &self.fallback) {
-                // The primary client's middleware has already waited out `Retry-After` and
-                // retried; the shared ncspot quota is no better placed to serve the request.
-                (Some(reqwest::StatusCode::TOO_MANY_REQUESTS), _) => Err(error),
+                // The primary client's middleware has already waited out a short `Retry-After`
+                // and retried; the shared ncspot quota is no better placed to serve the request.
+                // A penalty too long to wait out (hours) does go to ncspot.
+                (Some(reqwest::StatusCode::TOO_MANY_REQUESTS), _)
+                    if !Self::is_long_rate_limit(&error) =>
+                {
+                    Err(error)
+                }
                 (Some(status), Some(fallback)) => {
                     Self::log_fallback("GET", url, status);
                     fallback.api_get(url, payload).await
@@ -512,6 +532,37 @@ mod tests {
             "fallback"
         );
         assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn long_custom_rate_limit_on_get_uses_fallback_without_waiting() {
+        let primary_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "82394"))
+            .expect(1)
+            .mount(&primary_server)
+            .await;
+        let fallback_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ncspot"))
+            .expect(1)
+            .mount(&fallback_server)
+            .await;
+
+        let client = WebApiClient::new(
+            client(&primary_server, true).await,
+            Some(client(&fallback_server, true).await),
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.api_get("test", &Query::new()),
+        )
+        .await
+        .expect("a long Retry-After must not be waited out");
+        assert_eq!(response.unwrap(), "ncspot");
     }
 
     #[tokio::test]

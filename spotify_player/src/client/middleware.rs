@@ -13,6 +13,11 @@ use tokio::{
 
 const GET_DEDUPLICATION_WINDOW: Duration = Duration::from_secs(1);
 
+/// Longest `Retry-After` period worth waiting out. Spotify can impose penalties of many hours
+/// (e.g. a development-mode client over its quota gets ~23h); requests during a longer period
+/// are answered with a `429` straight away so the caller can fall back instead of hanging.
+pub(super) const MAX_RETRY_AFTER_WAIT: Duration = Duration::from_secs(60);
+
 #[derive(Clone, Debug)]
 struct CachedResponse {
     status: StatusCode,
@@ -132,7 +137,9 @@ impl SpotifyApiRequestManager {
         })
     }
 
-    async fn wait_for_retry_after(&self) {
+    /// Waits out an active `Retry-After` period of at most [`MAX_RETRY_AFTER_WAIT`]. If the period
+    /// is longer, returns what remains of it without waiting.
+    async fn wait_for_retry_after(&self) -> Option<Duration> {
         loop {
             let retry_after_until = {
                 let mut state = self.state.lock().await;
@@ -146,14 +153,15 @@ impl SpotifyApiRequestManager {
                 }
             };
 
-            let Some(retry_after_until) = retry_after_until else {
-                return;
-            };
+            let retry_after_until = retry_after_until?;
+
+            let remaining = retry_after_until.saturating_duration_since(Instant::now());
+            if remaining > MAX_RETRY_AFTER_WAIT {
+                return Some(remaining);
+            }
 
             tracing::debug!(
-                wait_ms = retry_after_until
-                    .saturating_duration_since(Instant::now())
-                    .as_millis(),
+                wait_ms = remaining.as_millis(),
                 "Rescheduling Spotify Web API GET request after global rate limit"
             );
             tokio::time::sleep_until(retry_after_until).await;
@@ -323,7 +331,14 @@ impl SpotifyApiMiddleware {
         let url = request.url();
 
         for attempt in 0..=self.requests.max_retries {
-            self.requests.wait_for_retry_after().await;
+            if let Some(remaining) = self.requests.wait_for_retry_after().await {
+                tracing::warn!(
+                    %url,
+                    remaining_secs = remaining.as_secs(),
+                    "Spotify Web API rate limit outlasts the wait cap; not sending GET request"
+                );
+                return Ok(Self::rate_limited_response(url, remaining));
+            }
             if attempt > 0 {
                 tracing::warn!(
                     %url,
@@ -343,7 +358,7 @@ impl SpotifyApiMiddleware {
 
             let retry_after = Self::retry_after(response.headers());
             if response.status() != StatusCode::TOO_MANY_REQUESTS
-                || retry_after.is_none()
+                || retry_after.is_none_or(|retry_after| retry_after > MAX_RETRY_AFTER_WAIT)
                 || attempt == self.requests.max_retries
             {
                 return Ok(response);
@@ -351,6 +366,24 @@ impl SpotifyApiMiddleware {
         }
 
         unreachable!("GET retry loop always returns a response or error")
+    }
+
+    /// A `429` answered locally during a `Retry-After` period too long to wait out.
+    fn rate_limited_response(url: &Url, remaining: Duration) -> Response {
+        http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .url(url.clone())
+            .header(RETRY_AFTER, remaining.as_secs().max(1))
+            .body(Vec::new())
+            .expect("local rate-limit response is valid")
+            .into()
+    }
+
+    /// Whether a response is a `429` whose `Retry-After` is too long to be worth waiting out.
+    pub(super) fn is_long_rate_limit(status: StatusCode, headers: &HeaderMap) -> bool {
+        status == StatusCode::TOO_MANY_REQUESTS
+            && Self::retry_after(headers)
+                .is_some_and(|retry_after| retry_after > MAX_RETRY_AFTER_WAIT)
     }
 }
 
@@ -478,8 +511,57 @@ mod tests {
         assert!(!waiting.is_finished());
 
         tokio::time::advance(Duration::from_secs(11)).await;
-        waiting.await.unwrap();
+        assert_eq!(waiting.await.unwrap(), None);
         assert_eq!(requests.retry_after_remaining().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn does_not_wait_for_retry_after_beyond_cap() {
+        let requests = SpotifyApiRequestManager::new(2);
+        requests.store_retry_after(Duration::from_secs(82394)).await;
+
+        let remaining = requests.wait_for_retry_after().await;
+
+        assert_eq!(remaining, Some(Duration::from_secs(82395)));
+    }
+
+    #[tokio::test]
+    async fn long_rate_limit_is_returned_without_retry_and_blocks_later_gets_locally() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "82394"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(SpotifyApiMiddleware::new(&format!("{}/v1", server.uri()), 2).unwrap())
+            .build();
+        let get = || async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get(format!("{}/v1/me", server.uri())).send(),
+            )
+            .await
+            .expect("a long Retry-After must not be waited out")
+            .unwrap()
+        };
+
+        let first = get().await;
+        assert!(SpotifyApiMiddleware::is_long_rate_limit(
+            first.status(),
+            first.headers()
+        ));
+
+        // past the 1s GET coalescing window, so this is a fresh request answered locally
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let second = get().await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(SpotifyApiMiddleware::is_long_rate_limit(
+            second.status(),
+            second.headers()
+        ));
     }
 
     #[tokio::test(start_paused = true)]
