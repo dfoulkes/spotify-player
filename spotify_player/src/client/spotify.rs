@@ -304,6 +304,9 @@ impl BaseClient for WebApiClient {
 
         match self.primary.api_get(url, payload).await {
             Err(error) => match (Self::fallback_status(&error), &self.fallback) {
+                // The primary client's middleware has already waited out `Retry-After` and
+                // retried; the shared ncspot quota is no better placed to serve the request.
+                (Some(reqwest::StatusCode::TOO_MANY_REQUESTS), _) => Err(error),
                 (Some(status), Some(fallback)) => {
                     Self::log_fallback("GET", url, status);
                     fallback.api_get(url, payload).await
@@ -480,34 +483,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_rate_limit_falls_back_before_ncspot_retries() {
+    async fn custom_rate_limit_on_get_retries_primary_without_fallback() {
         let primary_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/test"))
-            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
-            .expect(1)
-            .mount(&primary_server)
-            .await;
-        let fallback_server = MockServer::start().await;
-        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("GET"))
             .and(path("/v1/test"))
             .respond_with(RateLimitThenOk {
-                calls: Arc::clone(&fallback_calls),
+                calls: Arc::clone(&primary_calls),
             })
+            .mount(&primary_server)
+            .await;
+        let fallback_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ncspot"))
+            .expect(0)
             .mount(&fallback_server)
             .await;
 
         let client = WebApiClient::new(
-            client(&primary_server, false).await,
+            client(&primary_server, true).await,
             Some(client(&fallback_server, true).await),
         );
 
+        // `RateLimitThenOk` answers 429 first, then 200 with body "fallback"; here it is the primary
         assert_eq!(
             client.api_get("test", &Query::new()).await.unwrap(),
             "fallback"
         );
-        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_custom_rate_limit_on_get_does_not_use_fallback() {
+        let primary_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .expect(2)
+            .mount(&primary_server)
+            .await;
+        let fallback_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&fallback_server)
+            .await;
+
+        let client = WebApiClient::new(
+            client(&primary_server, true).await,
+            Some(client(&fallback_server, true).await),
+        );
+
+        assert!(client.api_get("test", &Query::new()).await.is_err());
     }
 
     #[tokio::test]

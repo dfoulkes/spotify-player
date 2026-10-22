@@ -137,11 +137,19 @@ pub fn new_api_client() -> Result<WebApiClient> {
         %id,
         "Using custom Spotify Web API client with ncspot fallback"
     );
+    // The custom client gets its own middleware instance, so it honours its own quota's
+    // `Retry-After` instead of handing rate-limited requests to the shared ncspot client.
+    let primary_config = build_config(&primary_cache_file);
+    let primary_middleware = SpotifyApiMiddleware::new(
+        &primary_config.api_base_url,
+        configs.app_config.api_rate_limit_retries,
+    )?;
     let primary = rspotify::AuthCodePkceSpotify::with_config(
         rspotify::Credentials { id, secret: None },
         build_oauth(configs.app_config.login_redirect_uri.clone()),
-        build_config(&primary_cache_file),
-    );
+        primary_config,
+    )
+    .with_middleware(primary_middleware);
 
     let fallback_cache_file = format!("{}_token.json", auth::NCSPOT_CLIENT_ID);
     let fallback_config = build_config(&fallback_cache_file);

@@ -245,9 +245,9 @@ By default, `spotify_player` uses [ncspot](https://github.com/hrkfdn/ncspot)'s c
 
 The ncspot client ID remains available as a fallback because it is registered in [extended quota mode](https://developer.spotify.com/documentation/web-api/concepts/quota-modes) and predates Spotify's [November 2024 Web API changes](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api). It can access endpoints (browse, personalized content, generated playlists, …) that newly-registered applications can no longer use.
 
-When a custom `client_id` is configured, `spotify-player` sends most Web API requests through that client first. If Spotify rejects custom-client request with any `4xx` response, the request is attempted once through ncspot. Successful requests and failures outside the `4xx` range do not trigger fallback.
+When a custom `client_id` is configured, `spotify-player` sends most Web API requests through that client first. If Spotify rejects a custom-client request with a `4xx` response, the request is attempted once through ncspot. A GET request that is still rate limited (`429`) after the custom client's own retries is not sent to ncspot. Successful requests and failures outside the `4xx` range do not trigger fallback.
 
-The custom client uses no request middleware. The ncspot client stores `Retry-After` durations and retries rate-limited GET requests up to two times by default; mutation requests are never delayed or retried by the middleware. Configure the ncspot retry count with `api_rate_limit_retries`; see the [configuration documentation](https://github.com/aome510/spotify-player/blob/master/docs/config.md) for details.
+The custom and ncspot clients each have their own request middleware, which stores `Retry-After` durations for that client's quota and retries rate-limited GET requests up to two times by default; mutation requests are never delayed or retried by the middleware. Configure the retry count with `api_rate_limit_retries`; see the [configuration documentation](https://github.com/aome510/spotify-player/blob/master/docs/config.md) for details.
 
 ### Using a custom client ID
 
