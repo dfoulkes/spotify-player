@@ -1032,13 +1032,15 @@ impl AppClient {
 
     /// Get all albums of an artist
     pub async fn artist_albums(&self, artist_id: ArtistId<'_>) -> Result<Vec<Album>> {
+        // development-mode clients get `400 Invalid limit` for page sizes above 10 here
         let albums = self
-            .all_paging_items::<rspotify::model::SimplifiedAlbum>(
+            .all_paging_items_with_limit::<rspotify::model::SimplifiedAlbum>(
                 &format!(
                     "artists/{}/albums?include_groups=album,single",
                     artist_id.id()
                 ),
                 0, // we don't know the total number of artist albums beforehand
+                10,
             )
             .await?
             .into_iter()
@@ -1626,11 +1628,22 @@ impl AppClient {
         Ok(serde_json::from_str(&text)?)
     }
 
-    async fn all_paging_items<T>(&self, base_url: &str, mut count: usize) -> Result<Vec<T>>
+    async fn all_paging_items<T>(&self, base_url: &str, count: usize) -> Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned + std::fmt::Debug,
     {
-        const PAGE_LIMIT: usize = 50;
+        self.all_paging_items_with_limit(base_url, count, 50).await
+    }
+
+    async fn all_paging_items_with_limit<T>(
+        &self,
+        base_url: &str,
+        mut count: usize,
+        page_limit: usize,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug,
+    {
         const MAX_PARALLEL: usize = 4;
 
         let mut all_items = Vec::new();
@@ -1643,13 +1656,13 @@ impl AppClient {
         }
 
         while offset < count {
-            n_jobs = std::cmp::min(n_jobs, (count - offset).div_ceil(PAGE_LIMIT));
+            n_jobs = std::cmp::min(n_jobs, (count - offset).div_ceil(page_limit));
 
             let mut futures = Vec::with_capacity(n_jobs);
 
             for i in 0..n_jobs {
-                let current_offset = offset + i * PAGE_LIMIT;
-                let limit_str = PAGE_LIMIT.to_string();
+                let current_offset = offset + i * page_limit;
+                let limit_str = page_limit.to_string();
                 let offset_str = current_offset.to_string();
 
                 futures.push(async move {
@@ -1667,7 +1680,7 @@ impl AppClient {
 
             let mut found_partial_page = false;
             for mut page in results {
-                if page.items.len() < PAGE_LIMIT {
+                if page.items.len() < page_limit {
                     found_partial_page = true;
                 }
                 all_items.append(&mut page.items);
@@ -1677,7 +1690,7 @@ impl AppClient {
                 break;
             }
 
-            offset += n_jobs * PAGE_LIMIT;
+            offset += n_jobs * page_limit;
             // gradually increase the number of parallel jobs, but do not exceed MAX_PARALLEL
             n_jobs = std::cmp::min(n_jobs + 1, MAX_PARALLEL);
         }
