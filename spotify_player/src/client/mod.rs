@@ -163,6 +163,10 @@ pub fn new_api_client() -> Result<WebApiClient> {
         .with_ncspot_only_get_endpoints(ncspot_only_get_endpoints))
 }
 
+/// How long an artist page waits for optional data (top tracks, related artists) before
+/// rendering without it.
+const OPTIONAL_ARTIST_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Removes a context URI from the in-flight set when dropped, however the request ends.
 struct PendingContextGuard<'a> {
     pending: &'a Mutex<HashSet<String>>,
@@ -1547,45 +1551,57 @@ impl AppClient {
         let artist_uri = artist_id.uri();
         tracing::info!("Get artist context: {}", artist_uri);
 
-        // get the artist's information, including top tracks, related artists, and albums
-
-        let artist = self
-            .artist(artist_id.as_ref())
-            .await
-            .context("get artist")?
-            .into();
-
-        // top tracks are unavailable to development-mode clients (403) and can be rate limited
-        // on the ncspot fallback, so don't let them block the rest of the artist page
+        // get the artist's information, including top tracks, related artists, and albums.
+        // Top tracks and related artists are unavailable to development-mode clients (403), so
+        // they go through the ncspot fallback, whose rate-limit retries can take minutes. They
+        // are optional, so fetch everything concurrently and give them a deadline instead of
+        // letting them hold the artist page on "Loading".
         #[allow(deprecated)]
-        let top_tracks = match self
-            .artist_top_tracks(artist_id.as_ref(), Some(rspotify::model::Market::FromToken))
-            .await
-        {
-            Ok(tracks) => tracks
+        let (artist, top_tracks, related_artists, albums) = tokio::join!(
+            self.artist(artist_id.as_ref()),
+            tokio::time::timeout(
+                OPTIONAL_ARTIST_DATA_TIMEOUT,
+                self.artist_top_tracks(
+                    artist_id.as_ref(),
+                    Some(rspotify::model::Market::FromToken)
+                ),
+            ),
+            tokio::time::timeout(
+                OPTIONAL_ARTIST_DATA_TIMEOUT,
+                self.artist_related_artists(artist_id.as_ref()),
+            ),
+            self.artist_albums(artist_id.as_ref()),
+        );
+
+        let artist = artist.context("get artist")?.into();
+        let albums = albums.context("get artist's albums")?;
+
+        let top_tracks = match top_tracks {
+            Ok(Ok(tracks)) => tracks
                 .into_iter()
                 .filter_map(Track::try_from_full_track)
                 .collect::<Vec<_>>(),
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::warn!("Failed to get artist's top tracks for {artist_uri}: {err:#}");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!("Timed out getting artist's top tracks for {artist_uri}");
                 Vec::new()
             }
         };
 
-        #[allow(deprecated)]
-        let related_artists = self
-            .artist_related_artists(artist_id.as_ref())
-            .await
-            .ok()
-            .unwrap_or_default()
-            .into_iter()
-            .map(std::convert::Into::into)
-            .collect::<Vec<_>>();
-
-        let albums = self
-            .artist_albums(artist_id.as_ref())
-            .await
-            .context("get artist's albums")?;
+        let related_artists = match related_artists {
+            Ok(Ok(artists)) => artists
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect::<Vec<_>>(),
+            Ok(Err(_)) => Vec::new(),
+            Err(_) => {
+                tracing::warn!("Timed out getting artist's related artists for {artist_uri}");
+                Vec::new()
+            }
+        };
 
         Ok(Context::Artist {
             artist,
