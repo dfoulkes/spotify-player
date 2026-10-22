@@ -76,6 +76,8 @@ pub struct AppClient {
     auth_config: AuthConfig,
     /// The Spotify Web API client, used for interacting with Spotify Web APIs
     api_client: WebApiClient,
+    /// URIs of contexts with a `GetContext` request in flight, to avoid duplicate fetches
+    pending_contexts: Arc<Mutex<HashSet<String>>>,
     #[cfg(feature = "streaming")]
     stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
 }
@@ -161,6 +163,18 @@ pub fn new_api_client() -> Result<WebApiClient> {
         .with_ncspot_only_get_endpoints(ncspot_only_get_endpoints))
 }
 
+/// Removes a context URI from the in-flight set when dropped, however the request ends.
+struct PendingContextGuard<'a> {
+    pending: &'a Mutex<HashSet<String>>,
+    uri: String,
+}
+
+impl Drop for PendingContextGuard<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.uri);
+    }
+}
+
 impl AppClient {
     /// Construct a new client
     pub async fn new() -> Result<Self> {
@@ -177,6 +191,7 @@ impl AppClient {
             http: reqwest::Client::new(),
             auth_config,
             api_client,
+            pending_contexts: Arc::new(Mutex::new(HashSet::new())),
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
@@ -589,6 +604,15 @@ impl AppClient {
                     && !state.data.read().caches.context.contains_key(&uri);
                 let is_liked = uri == USER_LIKED_TRACKS_URI;
                 if cache_miss || is_liked {
+                    if !self.pending_contexts.lock().insert(uri.clone()) {
+                        tracing::debug!("Context {uri} is already being fetched, skipping");
+                        return Ok(());
+                    }
+                    let _pending = PendingContextGuard {
+                        pending: &self.pending_contexts,
+                        uri: uri.clone(),
+                    };
+
                     let ctx = match context {
                         ContextId::Playlist(playlist_id) => {
                             self.playlist_context(playlist_id).await?
@@ -1529,14 +1553,22 @@ impl AppClient {
             .context("get artist")?
             .into();
 
+        // top tracks are unavailable to development-mode clients (403) and can be rate limited
+        // on the ncspot fallback, so don't let them block the rest of the artist page
         #[allow(deprecated)]
-        let top_tracks = self
+        let top_tracks = match self
             .artist_top_tracks(artist_id.as_ref(), Some(rspotify::model::Market::FromToken))
             .await
-            .context("get artist's top tracks")?
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect::<Vec<_>>();
+        {
+            Ok(tracks) => tracks
+                .into_iter()
+                .filter_map(Track::try_from_full_track)
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                tracing::warn!("Failed to get artist's top tracks for {artist_uri}: {err:#}");
+                Vec::new()
+            }
+        };
 
         #[allow(deprecated)]
         let related_artists = self
@@ -2045,9 +2077,32 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 #[cfg(test)]
 mod tests {
-    use super::{move_seed_track_to_front, parse_current_playback_response};
+    use super::{move_seed_track_to_front, parse_current_playback_response, PendingContextGuard};
     use crate::state::Track;
+    use parking_lot::Mutex;
     use rspotify::model::{PlayableItem, TrackId};
+    use std::collections::HashSet;
+
+    #[test]
+    fn pending_context_guard_clears_uri_on_drop() {
+        let uri = "spotify:artist:3gd8FJtBJtkRxdfbTu19U2";
+        let pending = Mutex::new(HashSet::new());
+        assert!(pending.lock().insert(uri.to_string()));
+        {
+            let _pending = PendingContextGuard {
+                pending: &pending,
+                uri: uri.to_string(),
+            };
+            assert!(
+                !pending.lock().insert(uri.to_string()),
+                "a duplicate request must be rejected while one is in flight"
+            );
+        }
+        assert!(
+            pending.lock().is_empty(),
+            "the guard must clear the URI when dropped"
+        );
+    }
 
     fn sample_track(id: &'static str, name: &str) -> Track {
         Track {
